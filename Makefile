@@ -43,6 +43,29 @@ run-ecs:
 	@echo -e "$(OK_COLOR)==> Running $(ECS_NAME)...$(NO_COLOR)"
 	@go run cmd/ecs/*.go -p=1235 -k=1236
 
+
+# NDN targets
+
+run-ndn-server:
+	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) (port 6363)...$(NO_COLOR)"
+	@go run cmd/ndn-server/main.go -i=server1 -b=localhost:1235 -p=6363
+
+run-ndn-server-2:
+	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) 2 (port 6365)...$(NO_COLOR)"
+	@mkdir -p ./db-data/ndn-server2
+	@go run cmd/ndn-server/main.go -i=server2 -b=localhost:1235 -d=./db-data/ndn-server2 -p=6365
+
+run-ndn-server-3:
+	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) 3 (port 6367)...$(NO_COLOR)"
+	@mkdir -p ./db-data/ndn-server3
+	@go run cmd/ndn-server/main.go -i=server3 -b=localhost:1235 -d=./db-data/ndn-server3 -p=6367
+
+run-ndn-client:
+	@echo -e "$(OK_COLOR)==> Running NDN $(CLIENT_NAME)...$(NO_COLOR)"
+	@go run cmd/ndn-client/main.go -s=server1 -a=localhost:6363
+
+
+
 build-client: test
 	@echo -e "$(OK_COLOR)==> Building $(CLIENT_NAME)...$(NO_COLOR)"
 	@go build -o bin/$(CLIENT_NAME) ./cmd/client
