@@ -45,6 +45,9 @@ type ECSClient struct {
 	pollSeq   atomic.Uint64
 	mu        sync.Mutex
 	joined    bool
+
+	// UUID assigned by ECS on join
+	id uuid.UUID
 }
 
 func NewECSClient(engine ndnlib.Engine, serverID, ndnAddr string) *ECSClient {
@@ -92,8 +95,14 @@ func (c *ECSClient) Join() error {
 		return fmt.Errorf("ECS join failed: %s", result.Message)
 	}
 
+	nodeID, err := uuid.Parse(result.Message)
+	if err != nil {
+		return fmt.Errorf("failed to parse ECS-assigned uuid %q: %w", result.Message, err)
+	}
+
 	c.mu.Lock()
 	c.joined = true
+	c.id = nodeID
 	c.mu.Unlock()
 
 	log.Infof("joined ECS network (uuid=%s)", result.Message)
@@ -150,6 +159,12 @@ func (c *ECSClient) StartHeartbeats() <-chan error {
 
 func (c *ECSClient) Close() {
 	close(c.quit)
+}
+
+func (c *ECSClient) ID() uuid.UUID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.id
 }
 
 // Leave initiates a graceful leave from the ECS.
@@ -385,8 +400,8 @@ func ecsParseMetadata(raw string) (protocol.Metadata, error) {
 			continue
 		}
 
-		parts := strings.SplitN(entry, ",", 7)
-		if len(parts) != 7 {
+		parts := strings.SplitN(entry, ",", 8)
+		if len(parts) != 8 {
 			return nil, fmt.Errorf("invalid metadata entry: %q (got %d parts)", entry, len(parts))
 		}
 
@@ -415,6 +430,7 @@ func ecsParseMetadata(raw string) (protocol.Metadata, error) {
 			End:         end,
 			PrivateAddr: ecsResolveAddr(parts[5]),
 			Addr:        ecsResolveAddr(parts[6]),
+			NDNServerID: parts[7],
 		})
 	}
 

@@ -6,11 +6,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nStangl/distributed-kv-store/protocol"
+	// "github.com/nStangl/distributed-kv-store/protocol"
 	dbLog "github.com/nStangl/distributed-kv-store/server/log"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
 )
+
+type ReplicationSender interface {
+	Replicate(replica Replica, key, value string) error
+}
 
 type (
 	// Manager is responsible for the runtime management of
@@ -21,16 +25,16 @@ type (
 		tasks    []task
 		seeker   dbLog.SeekingLog
 		replicas []Replica
+		sender   ReplicationSender
 	}
-
 	task struct {
 		checkpoint int
 		replica    Replica
 		tasks      chan dbLog.SeekResult
-		proto      protocol.Protocol[protocol.ServerMessage]
 		done       chan struct{}
 	}
 )
+
 
 const interval = time.Second
 
@@ -42,8 +46,11 @@ func (t *task) Close() {
 	close(t.tasks)
 }
 
-func NewManager(seeker dbLog.SeekingLog) *Manager {
-	return &Manager{seeker: seeker}
+func NewManager(seeker dbLog.SeekingLog, sender ReplicationSender) *Manager {
+	return &Manager{
+		seeker: seeker,
+		sender: sender,
+	}
 }
 
 func (m *Manager) Start(ctx context.Context) <-chan struct{} {
@@ -120,22 +127,20 @@ func (m *Manager) reconcile(before, after []Replica) error {
 
 		switch d.Kind {
 		case Added:
-			c, err := protocol.Connect(d.Replica.PrivateAddr.String())
-			if err != nil {
-				result = multierr.Append(result, fmt.Errorf("failed to connect to %s: %w", d.Replica, err))
+			if d.Replica.NDNServerID == "" {
+				result = multierr.Append(result, fmt.Errorf("replica %v missing NDN server ID", d.Replica))
 				continue
 			}
 
-			log.Infof("added replica for %s", c.RemoteAddr().String())
+			log.Infof("added replica for NDN server %s", d.Replica.NDNServerID)
 
 			m.tasks = append(m.tasks, task{
 				replica: d.Replica,
-				proto:   protocol.ForServer(c),
 				tasks:   make(chan dbLog.SeekResult, 10),
 				done:    make(chan struct{}),
 			})
 
-			go processTask(m.tasks[len(m.tasks)-1])
+			go processTask(m.tasks[len(m.tasks)-1], m.sender)
 		case Removed:
 			newReplicas := make([]task, 0, len(m.tasks))
 
@@ -172,13 +177,9 @@ func (m *Manager) schedule() {
 	}
 }
 
-func processTask(r task) {
+func processTask(r task, sender ReplicationSender) {
 	defer func() {
 		close(r.done)
-
-		if !r.proto.Closed() {
-			_ = r.proto.Close()
-		}
 	}()
 
 	for t := range r.tasks {
@@ -188,15 +189,15 @@ func processTask(r task) {
 				continue
 			}
 
-			log.Infof("replicating %s to %s", c, r.proto)
-
-			msg := protocol.ServerMessage{Type: protocol.ReplicateTuple, Key: c.Key}
+			value := ""
 			if c.Kind == dbLog.Set {
-				msg.Value = c.Value
+				value = c.Value
 			}
 
-			if err := r.proto.Send(msg); err != nil {
-				log.Errorf("failed to replicate %s to %s: %v", c, r.proto, err)
+			log.Infof("replicating %s to %s", c, r.replica.NDNServerID)
+
+			if err := sender.Replicate(r.replica, c.Key, value); err != nil {
+				log.Errorf("failed to replicate %s to %s: %v", c, r.replica.NDNServerID, err)
 			}
 		}
 	}

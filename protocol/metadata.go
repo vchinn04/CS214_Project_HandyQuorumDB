@@ -16,15 +16,14 @@ import (
 
 type (
 	KeyRange struct {
-		// Unique ID of each node
 		ID uuid.UUID
-		// Is this node a replica for this keyrange
 		Replica Replica
-		// The address of the node
 		Addr *net.TCPAddr
-		// The private address of the node
 		PrivateAddr *net.TCPAddr
-		// The actual key range
+
+		// NDN-facing server identifier, used to build /kv/<serverID> names.
+		NDNServerID string
+
 		Start, End uint128.Uint128
 	}
 
@@ -41,13 +40,15 @@ func (k *KeyRange) Copy() KeyRange {
 		Replica:     k.Replica,
 		Addr:        util.CopyAddr(k.Addr),
 		PrivateAddr: util.CopyAddr(k.PrivateAddr),
+		NDNServerID: k.NDNServerID,
 		Start:       k.Start,
 		End:         k.End,
 	}
 }
 
 func (k *KeyRange) String() string {
-	return fmt.Sprintf("%s,%t,%s,%s,%s,%s", k.ID, k.Replica, k.Start, k.End, k.PrivateAddr, k.Addr)
+	return fmt.Sprintf("%s,%t,%s,%s,%s,%s,%s",
+		k.ID, k.Replica, k.Start, k.End, k.PrivateAddr, k.Addr, k.NDNServerID)
 }
 
 func (k *KeyRange) IsReplica() bool {
@@ -103,6 +104,9 @@ func (m Metadata) Bytes() []byte {
 		b.WriteRune(',')
 
 		b.WriteString(m[i].Addr.String())
+		b.WriteRune(',')
+
+		b.WriteString(m[i].NDNServerID)
 		b.WriteRune(';')
 	}
 
@@ -157,8 +161,8 @@ func parseMetadata(raw string) (Metadata, error) {
 	scanner.Split(splitBy(';'))
 
 	for scanner.Scan() {
-		p := strings.SplitN(scanner.Text(), ",", 7)
-		if len(p) != 7 {
+		p := strings.SplitN(scanner.Text(), ",", 8)
+		if len(p) != 8 {
 			return nil, ErrInvalidKeyRange
 		}
 
@@ -197,6 +201,8 @@ func parseMetadata(raw string) (Metadata, error) {
 			return nil, fmt.Errorf("failed to parse range address: %w", err)
 		}
 
+		ndnServerID := p[7]
+
 		ranges = append(ranges, KeyRange{
 			ID:          id,
 			Replica:     Replica{readRep, writeRep},
@@ -204,6 +210,7 @@ func parseMetadata(raw string) (Metadata, error) {
 			End:         end,
 			Addr:        addr,
 			PrivateAddr: privateAddr,
+			NDNServerID: ndnServerID,
 		})
 	}
 

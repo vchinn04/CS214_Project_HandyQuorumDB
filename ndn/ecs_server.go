@@ -480,6 +480,7 @@ func (e *ECSCoordinator) findRange(serverID string) protocol.KeyRange {
 		ID:          entry.ID,
 		Addr:        addr,
 		PrivateAddr: addr,
+		NDNServerID: entry.ServerID,
 		Start:       predKey,
 		End:         entry.HashKey,
 	}

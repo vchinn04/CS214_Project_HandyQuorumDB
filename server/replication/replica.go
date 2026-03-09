@@ -13,10 +13,11 @@ import (
 type Replica struct {
 	Start, End  uint128.Uint128
 	PrivateAddr *net.TCPAddr
+	NDNServerID string
 }
 
 func (r *Replica) String() string {
-	return fmt.Sprintf("replica(%s,%s,%s)", r.PrivateAddr, r.Start, r.End)
+	return fmt.Sprintf("replica(%s,%s,%s,%s)", r.PrivateAddr, r.Start, r.End, r.NDNServerID)
 }
 
 // FromMetadata - get tasks for a given coordinator
@@ -35,7 +36,8 @@ func FromMetadata(m protocol.Metadata, coordinator uuid.UUID) []Replica {
 				Start:       m[i].Start,
 				End:         m[i].End,
 				PrivateAddr: m[i].PrivateAddr,
-			})
+				NDNServerID: m[i].NDNServerID,
+				})
 		}
 	}
 

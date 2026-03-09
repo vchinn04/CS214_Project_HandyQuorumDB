@@ -120,11 +120,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return memtable.NewRedBlackTree()
 	})
 
-	// --- Replication manager ---
-
-	r := replication.NewManager(lg)
-	rdone := r.Start(ctx)
-
 	// --- NDN KV server ---
 
 	signer := kvndn.NewSha256Signer()
@@ -133,11 +128,15 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create NDN server: %w", err)
 	}
 
+	// --- Replication manager ---
+
+	repSender := &ndnReplicationSender{server: ndnServer}
+	r := replication.NewManager(lg, repSender)
+	rdone := r.Start(ctx)
+
 	if err := ndnServer.Start(); err != nil {
 		return fmt.Errorf("failed to start NDN server: %w", err)
 	}
-
-	log.Infof("NDN KV server ready on prefix /kv/%s", serverID)
 
 	// --- NDN ECS client ---
 
@@ -155,9 +154,10 @@ func run(cmd *cobra.Command, args []string) error {
 
 	ecsClient := kvndn.NewECSClient(ecsEngine, serverID, fmt.Sprintf("localhost:%d", ndnPort))
 	ecsCallbacks := &ndnECSCallbacks{
-		server:    ndnServer,
-		ecsClient: ecsClient,
-		store:     kvStore,
+		server:     ndnServer,
+		ecsClient:  ecsClient,
+		store:      kvStore,
+		replicator: r,
 	}
 	ecsClient.SetCallbacks(ecsCallbacks)
 
@@ -211,11 +211,47 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+type ndnReplicationSender struct {
+	server *kvndn.Server
+}
+
+func (s *ndnReplicationSender) Replicate(replica replication.Replica, key, value string) error {
+	if replica.NDNServerID == "" {
+		return fmt.Errorf("missing NDN server ID for replica")
+	}
+	if replica.PrivateAddr == nil {
+		return fmt.Errorf("missing private address for replica %s", replica.NDNServerID)
+	}
+
+	targetPrefix := fmt.Sprintf("/kv/%s", replica.NDNServerID)
+	targetURI := "tcp4://" + replica.PrivateAddr.String()
+
+	// Make sure the local embedded forwarder knows how to reach the target replica.
+	if err := kvndn.AddUpstreamRoute(s.server.Engine(), targetPrefix, targetURI); err != nil {
+		log.Warnf("could not add route to %s at %s: %v (proceeding anyway)",
+			replica.NDNServerID, targetURI, err)
+	}
+
+	resp, err := s.server.SvReplicate(replica.NDNServerID, key, value)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return fmt.Errorf("nil replication response from %s", replica.NDNServerID)
+	}
+	if resp.Status != kvndn.StatusSuccess {
+		return fmt.Errorf("replication rejected by %s: status=%s error=%s",
+			replica.NDNServerID, resp.Status, resp.Error)
+	}
+	return nil
+}
+
 // ndnECSCallbacks bridges NDN ECS events to the NDN KV server.
 type ndnECSCallbacks struct {
-	server    *kvndn.Server
-	ecsClient *kvndn.ECSClient
-	store     store.Store
+	server     *kvndn.Server
+	ecsClient  *kvndn.ECSClient
+	store      store.Store
+	replicator *replication.Manager
 }
 
 func (c *ndnECSCallbacks) OnWriteLockSet() error {
@@ -281,6 +317,11 @@ func parseHexUint128(s string) (uint128.Uint128, error) {
 
 func (c *ndnECSCallbacks) OnMetadataUpdated(meta protocol.Metadata) error {
 	c.server.SetMetadata(meta)
+
+	if err := c.replicator.Reconcile(replication.FromMetadata(meta, c.ecsClient.ID())); err != nil {
+		log.Errorf("failed to reconcile new metadata for replication: %v", err)
+	}
+
 	log.Infof("metadata updated: %s", meta)
 	return nil
 }
