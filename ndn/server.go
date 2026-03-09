@@ -10,6 +10,7 @@ import (
 	enc "github.com/named-data/ndnd/std/encoding"
 	ndnlib "github.com/named-data/ndnd/std/ndn"
 	"github.com/named-data/ndnd/std/types/optional"
+	"github.com/named-data/ndnd/std/utils"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/nStangl/distributed-kv-store/protocol"
@@ -124,6 +125,10 @@ func (s *Server) onInterest(args ndnlib.InterestHandlerArgs) {
 		s.handleKeyrange(args, name)
 	case OpKeyrangeRead:
 		s.handleKeyrangeRead(args, name)
+	case OpSvTransfer:
+		s.handleSvTransfer(args, name, parsed.Key, interest.AppParam())
+	case OpSvReplicate:
+		s.handleSvReplicate(args, name, parsed.Key, interest.AppParam())
 	default:
 		s.replyJSON(args, name, Response{Status: StatusError, Error: "unknown_operation"})
 	}
@@ -255,6 +260,146 @@ func (s *Server) handleKeyrangeRead(args ndnlib.InterestHandlerArgs, name enc.Na
 	}
 
 	s.replyJSON(args, name, Response{Status: StatusSuccess, Value: readableRanges.HexString()})
+}
+
+// Engine returns the underlying NDN engine (used for server-to-server operations).
+func (s *Server) Engine() ndnlib.Engine {
+	return s.engine
+}
+
+// SvTransfer sends a transfer Interest to targetServerID, writing key/value on
+// the remote server. An empty value signals a deletion.
+// This is called by the source server during a rebalancing handoff.
+func (s *Server) SvTransfer(targetServerID, key, value string) (*Response, error) {
+	name, err := SvTransferName(targetServerID, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build SV-TRANSFER name: %w", err)
+	}
+	var payload enc.Wire
+	if value != "" {
+		payload = enc.Wire{[]byte(value)}
+	}
+	return s.express(name, payload)
+}
+
+// SvReplicate sends a replication Interest to targetServerID, applying
+// key/value as a replicated entry on the remote server. An empty value signals
+// a replicated deletion.
+func (s *Server) SvReplicate(targetServerID, key, value string) (*Response, error) {
+	name, err := SvReplicateName(targetServerID, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build SV-REPLICATE name: %w", err)
+	}
+	var payload enc.Wire
+	if value != "" {
+		payload = enc.Wire{[]byte(value)}
+	}
+	return s.express(name, payload)
+}
+
+// express sends an outbound Interest from this server and waits for a Data
+// response. Used for server-to-server operations (SvTransfer, SvReplicate).
+func (s *Server) express(name enc.Name, appParam enc.Wire) (*Response, error) {
+	intCfg := &ndnlib.InterestConfig{
+		MustBeFresh: true,
+		Lifetime:    optional.Some(8 * time.Second),
+		Nonce:       utils.ConvertNonce(s.engine.Timer().Nonce()),
+	}
+
+	interest, err := s.engine.Spec().MakeInterest(name, intCfg, appParam, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Interest: %w", err)
+	}
+
+	type result struct {
+		resp *Response
+		err  error
+	}
+
+	ch := make(chan result, 1)
+
+	err = s.engine.Express(interest, func(args ndnlib.ExpressCallbackArgs) {
+		switch args.Result {
+		case ndnlib.InterestResultData:
+			content := args.Data.Content().Join()
+			var resp Response
+			if err := json.Unmarshal(content, &resp); err != nil {
+				ch <- result{err: fmt.Errorf("failed to parse response: %w", err)}
+				return
+			}
+			ch <- result{resp: &resp}
+		case ndnlib.InterestResultNack:
+			ch <- result{err: fmt.Errorf("Interest NACKed (reason=%d)", args.NackReason)}
+		case ndnlib.InterestResultTimeout:
+			ch <- result{err: fmt.Errorf("Interest timed out for %s", name)}
+		case ndnlib.InterestCancelled:
+			ch <- result{err: fmt.Errorf("Interest cancelled for %s", name)}
+		default:
+			ch <- result{err: fmt.Errorf("unexpected result %d for %s", args.Result, name)}
+		}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to express Interest: %w", err)
+	}
+
+	r := <-ch
+	return r.resp, r.err
+}
+
+// handleSvTransfer processes an inbound sv-transfer Interest.
+// The sending server is transferring authoritative ownership of a key to this server.
+// An empty AppParam signals a deletion.
+func (s *Server) handleSvTransfer(args ndnlib.InterestHandlerArgs, name enc.Name, key string, appParam enc.Wire) {
+	if key == "" {
+		s.replyJSON(args, name, Response{Status: StatusError, Error: "missing_key"})
+		return
+	}
+
+	value := string(appParam.Join())
+	if value == "" {
+		if err := s.store.Del(key); err != nil {
+			log.Errorf("store.Del (sv-transfer) failed: %v", err)
+			s.replyJSON(args, name, Response{Status: StatusError, Error: "internal"})
+			return
+		}
+	} else {
+		if err := s.store.Set(key, value); err != nil {
+			log.Errorf("store.Set (sv-transfer) failed: %v", err)
+			s.replyJSON(args, name, Response{Status: StatusError, Error: "internal"})
+			return
+		}
+	}
+
+	log.Debugf("sv-transfer applied: key=%q", key)
+	s.replyJSON(args, name, Response{Status: StatusSuccess, Key: key})
+}
+
+// handleSvReplicate processes an inbound sv-replicate Interest.
+// The coordinator is shipping a log entry to this replica node.
+// An empty AppParam signals a replicated deletion.
+func (s *Server) handleSvReplicate(args ndnlib.InterestHandlerArgs, name enc.Name, key string, appParam enc.Wire) {
+	if key == "" {
+		s.replyJSON(args, name, Response{Status: StatusError, Error: "missing_key"})
+		return
+	}
+
+	value := string(appParam.Join())
+	if value == "" {
+		if err := s.store.DelReplicated(key); err != nil {
+			log.Errorf("store.DelReplicated (sv-replicate) failed: %v", err)
+			s.replyJSON(args, name, Response{Status: StatusError, Error: "internal"})
+			return
+		}
+	} else {
+		if err := s.store.SetReplicated(key, value); err != nil {
+			log.Errorf("store.SetReplicated (sv-replicate) failed: %v", err)
+			s.replyJSON(args, name, Response{Status: StatusError, Error: "internal"})
+			return
+		}
+	}
+
+	log.Debugf("sv-replicate applied: key=%q", key)
+	s.replyJSON(args, name, Response{Status: StatusSuccess, Key: key})
 }
 
 // responsibleFor checks if this server owns the key based on metadata.

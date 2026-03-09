@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,10 +12,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"lukechampine.com/uint128"
 
 	kvndn "github.com/nStangl/distributed-kv-store/ndn"
 	"github.com/nStangl/distributed-kv-store/protocol"
-	"github.com/nStangl/distributed-kv-store/server/ecs"
 	dbLog "github.com/nStangl/distributed-kv-store/server/log"
 	"github.com/nStangl/distributed-kv-store/server/memtable"
 	"github.com/nStangl/distributed-kv-store/server/replication"
@@ -29,13 +30,13 @@ var (
 	directory string
 	logfile   string
 	loglevel  string
-	bootstrap string
+	ecsAddr   string
 	ndnPort   uint16
 
 	rootCmd = &cobra.Command{
 		Use:     "ndn-server",
 		Short:   "NDN-based KV store server",
-		Long:    "A KV store server that uses Named Data Networking (NDN) as the network layer.\nEach server starts its own embedded NDN forwarder (YaNFD).",
+		Long:    "A KV store server that uses Named Data Networking (NDN) as the network layer.\nEach server starts its own embedded NDN forwarder (YaNFD) and communicates\nwith the NDN-based ECS coordinator for cluster coordination.",
 		Version: version,
 		RunE:    run,
 	}
@@ -49,7 +50,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&directory, "directory", "d", "db-data", "Data directory for persistence")
 	rootCmd.PersistentFlags().StringVarP(&logfile, "logfile", "l", "log.db", "Relative path of the DB log file")
 	rootCmd.PersistentFlags().StringVarP(&loglevel, "loglevel", "o", "ALL", "Log level: ALL, DEBUG, INFO, WARN, ERROR")
-	rootCmd.PersistentFlags().StringVarP(&bootstrap, "bootstrap", "b", "127.0.0.1:9090", "ECS bootstrap address (TCP)")
+	rootCmd.PersistentFlags().StringVarP(&ecsAddr, "ecs-addr", "e", "localhost:9090", "NDN ECS forwarder TCP address (host:port)")
 	rootCmd.PersistentFlags().Uint16VarP(&ndnPort, "ndn-port", "p", 6363, "NDN forwarder TCP/UDP port for inter-server traffic")
 }
 
@@ -72,8 +73,6 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// --- Embedded NDN Forwarder ---
-	// Each server runs its own YaNFD instance with a unique Unix socket
-	// and unique TCP/UDP ports for inter-server connectivity.
 
 	fwCfg := kvndn.DefaultForwarderConfig(serverID, ndnPort)
 	fwCfg.LogLevel = "WARN"
@@ -86,7 +85,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.Infof("embedded NDN forwarder started (socket: %s, port: %d)", forwarder.SocketPath(), ndnPort)
 
-	// --- NDN Engine (connects to the embedded forwarder) ---
+	// --- NDN Engine for KV server (connects to own embedded forwarder) ---
 
 	ndnEngine, err := kvndn.NewEngineForForwarder(forwarder)
 	if err != nil {
@@ -96,7 +95,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.Info("NDN engine connected to embedded forwarder")
 
-	// --- Storage layer (same as TCP server) ---
+	// --- Storage layer ---
 
 	lg, err := dbLog.NewSeeking(filepath.Join(directory, logfile))
 	if err != nil {
@@ -140,41 +139,55 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.Infof("NDN KV server ready on prefix /kv/%s", serverID)
 
-	// --- ECS client (still TCP-based for coordination) ---
+	// --- NDN ECS client ---
 
-	ecsClient, err := ecs.NewClient(bootstrap)
+	ecsEngine, err := kvndn.NewEngine(kvndn.Config{
+		FaceType: "tcp",
+		FaceAddr: ecsAddr,
+		ServerID: serverID,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create ECS client: %w", err)
 	}
+	defer ecsEngine.Stop()
 
-	log.Info("connected to ECS via TCP at ", bootstrap)
+	log.Infof("connected to NDN ECS forwarder at %s", ecsAddr)
 
-	ecsClient.SetCallbacks(&ndnECSCallbacks{
-		server:     ndnServer,
-		replicator: r,
-	})
+	ecsClient := kvndn.NewECSClient(ecsEngine, serverID, fmt.Sprintf("localhost:%d", ndnPort))
+	ecsCallbacks := &ndnECSCallbacks{
+		server:    ndnServer,
+		ecsClient: ecsClient,
+		store:     kvStore,
+	}
+	ecsClient.SetCallbacks(ecsCallbacks)
+
+	if err := ecsClient.Join(); err != nil {
+		return fmt.Errorf("failed to join ECS network: %w", err)
+	}
+
+	log.Info("joined ECS network via NDN")
 
 	go func(ers <-chan error) {
 		for err := range ers {
-			log.Printf("ECS client error: %v", err)
+			log.Printf("ECS poll error: %v", err)
 		}
-	}(ecsClient.Listen())
+	}(ecsClient.StartPolling())
 
 	go func(ers <-chan error) {
 		for err := range ers {
 			log.Printf("ECS heartbeat error: %v", err)
 		}
-	}(ecsClient.SendHeartbeats())
+	}(ecsClient.StartHeartbeats())
 
-	if err := ecsClient.Transition(ctx, &protocol.ECSMessage{
-		Type:           protocol.JoinNetwork,
-		Address:        fmt.Sprintf("ndn:/kv/%s", serverID),
-		PrivateAddress: fmt.Sprintf("ndn:/kv/%s", serverID),
-	}); err != nil {
-		return fmt.Errorf("failed to join network via ECS: %w", err)
-	}
+	// if err := ecsClient.Transition(ctx, &protocol.ECSMessage{
+	// 	Type:           protocol.JoinNetwork,
+	// 	Address:        fmt.Sprintf("ndn:/kv/%s", serverID),
+	// 	PrivateAddress: fmt.Sprintf("ndn:/kv/%s", serverID),
+	// }); err != nil {
+	// 	return fmt.Errorf("failed to join network via ECS: %w", err)
+	// }
 
-	log.Info("joined ECS network")
+	// log.Info("joined ECS network")
 
 	// --- Wait for shutdown ---
 
@@ -198,10 +211,11 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// ndnECSCallbacks bridges ECS events to the NDN server.
+// ndnECSCallbacks bridges NDN ECS events to the NDN KV server.
 type ndnECSCallbacks struct {
-	server     *kvndn.Server
-	replicator *replication.Manager
+	server    *kvndn.Server
+	ecsClient *kvndn.ECSClient
+	store     store.Store
 }
 
 func (c *ndnECSCallbacks) OnWriteLockSet() error {
@@ -216,14 +230,63 @@ func (c *ndnECSCallbacks) OnWriteLockLifted() error {
 	return nil
 }
 
-func (c *ndnECSCallbacks) OnTransferRequested(meta protocol.Metadata) error {
-	log.Warn("NDN-based transfer not yet implemented; falling back to no-op")
-	return nil
+func (c *ndnECSCallbacks) OnTransferRequested(targetAddr, targetServerID, rangeStart, rangeEnd string) error {
+	log.Infof("transfer requested to %s (%s) range [%s..%s]", targetServerID, targetAddr, rangeStart, rangeEnd)
+
+	start, err := parseHexUint128(rangeStart)
+	if err != nil {
+		return fmt.Errorf("invalid rangeStart %q: %w", rangeStart, err)
+	}
+	end, err := parseHexUint128(rangeEnd)
+	if err != nil {
+		return fmt.Errorf("invalid rangeEnd %q: %w", rangeEnd, err)
+	}
+
+	keyRange := protocol.KeyRange{Start: start, End: end}
+
+	// Ensure the server's embedded forwarder has a face and route to the
+	// target server before we start expressing Interests toward it.
+	targetURI := "tcp4://" + targetAddr
+	targetPrefix := fmt.Sprintf("/kv/%s", targetServerID)
+	if err := kvndn.AddUpstreamRoute(c.server.Engine(), targetPrefix, targetURI); err != nil {
+		log.Warnf("could not add route to %s at %s: %v (proceeding anyway)", targetServerID, targetURI, err)
+	}
+
+	if err := kvndn.TransferRange(c.server, c.store, targetServerID, keyRange); err != nil {
+		return fmt.Errorf("data transfer to %s failed: %w", targetServerID, err)
+	}
+
+	return c.ecsClient.NotifyTransferDone()
+}
+
+// parseHexUint128 decodes a big-endian hex string produced by
+// util.Uint128BigEndian into a uint128.Uint128. Odd-length strings are
+// left-padded with a zero nibble before decoding.
+func parseHexUint128(s string) (uint128.Uint128, error) {
+	if len(s)%2 != 0 {
+		s = "0" + s
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return uint128.Uint128{}, fmt.Errorf("hex decode failed: %w", err)
+	}
+	// FromBytesBE requires exactly 16 bytes; pad on the left if shorter.
+	if len(b) < 16 {
+		padded := make([]byte, 16)
+		copy(padded[16-len(b):], b)
+		b = padded
+	}
+	return uint128.FromBytesBE(b), nil
 }
 
 func (c *ndnECSCallbacks) OnMetadataUpdated(meta protocol.Metadata) error {
 	c.server.SetMetadata(meta)
 	log.Infof("metadata updated: %s", meta)
+	return nil
+}
+
+func (c *ndnECSCallbacks) OnJoinComplete() error {
+	log.Info("join complete — ready to serve requests")
 	return nil
 }
 

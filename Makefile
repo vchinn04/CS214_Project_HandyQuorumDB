@@ -6,6 +6,9 @@ WARN_COLOR=\033[33;01m
 CLIENT_NAME=client
 SERVER_NAME=server
 ECS_NAME=ecs
+NDN_SERVER_NAME=ndn-server
+NDN_CLIENT_NAME=ndn-client
+NDN_ECS_NAME=ndn-ecs
 
 .PHONY: all format build
 all: format build
@@ -46,19 +49,23 @@ run-ecs:
 
 # NDN targets
 
+run-ndn-ecs:
+	@echo -e "$(OK_COLOR)==> Running NDN $(ECS_NAME) (port 9090)...$(NO_COLOR)"
+	@go run cmd/ndn-ecs/main.go -p=9090
+
 run-ndn-server:
 	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) (port 6363)...$(NO_COLOR)"
-	@go run cmd/ndn-server/main.go -i=server1 -b=localhost:1235 -p=6363
+	@go run cmd/ndn-server/main.go -i=server1 -e=localhost:9090 -p=6363
 
 run-ndn-server-2:
 	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) 2 (port 6365)...$(NO_COLOR)"
 	@mkdir -p ./db-data/ndn-server2
-	@go run cmd/ndn-server/main.go -i=server2 -b=localhost:1235 -d=./db-data/ndn-server2 -p=6365
+	@go run cmd/ndn-server/main.go -i=server2 -e=localhost:9090 -d=./db-data/ndn-server2 -p=6365
 
 run-ndn-server-3:
 	@echo -e "$(OK_COLOR)==> Running NDN $(SERVER_NAME) 3 (port 6367)...$(NO_COLOR)"
 	@mkdir -p ./db-data/ndn-server3
-	@go run cmd/ndn-server/main.go -i=server3 -b=localhost:1235 -d=./db-data/ndn-server3 -p=6367
+	@go run cmd/ndn-server/main.go -i=server3 -e=localhost:9090 -d=./db-data/ndn-server3 -p=6367
 
 run-ndn-client:
 	@echo -e "$(OK_COLOR)==> Running NDN $(CLIENT_NAME)...$(NO_COLOR)"
@@ -77,6 +84,20 @@ build-server: test
 build-ecs: test
 	@echo -e "$(OK_COLOR)==> Building $(ECS_NAME)...$(NO_COLOR)"
 	@go build -o bin/$(ECS_NAME) ./cmd/ecs
+
+build-ndn-server:
+	@echo -e "$(OK_COLOR)==> Building $(NDN_SERVER_NAME)...$(NO_COLOR)"
+	@go build -o bin/$(NDN_SERVER_NAME) ./cmd/ndn-server
+
+build-ndn-client:
+	@echo -e "$(OK_COLOR)==> Building $(NDN_CLIENT_NAME)...$(NO_COLOR)"
+	@go build -o bin/$(NDN_CLIENT_NAME) ./cmd/ndn-client
+
+build-ndn-ecs:
+	@echo -e "$(OK_COLOR)==> Building $(NDN_ECS_NAME)...$(NO_COLOR)"
+	@go build -o bin/$(NDN_ECS_NAME) ./cmd/ndn-ecs
+
+
 
 compile-client:
 	@echo -e "$(OK_COLOR)==> Compiling $(CLIENT_NAME) for Linux x86-64...$(NO_COLOR)"

@@ -25,6 +25,10 @@ const (
 	OpDelete       = "delete"
 	OpKeyrange     = "keyrange"
 	OpKeyrangeRead = "keyrange-read"
+
+	// Server-to-server operations
+	OpSvTransfer  = "sv-transfer"  // authoritative data transfer during rebalancing
+	OpSvReplicate = "sv-replicate" // async replication to replica nodes
 )
 
 // ServerPrefix returns the NDN name prefix for a specific server.
@@ -80,6 +84,28 @@ func KeyrangeName(serverID string) (enc.Name, error) {
 //	/kv/<server-id>/keyrange-read/<timestamp>
 func KeyrangeReadName(serverID string) (enc.Name, error) {
 	base, err := enc.NameFromStr(fmt.Sprintf("%s/%s/%s", PrefixKV, serverID, OpKeyrangeRead))
+	if err != nil {
+		return nil, err
+	}
+	return base.Append(enc.NewTimestampComponent(utils.MakeTimestamp(time.Now()))), nil
+}
+
+// SvTransferName returns an Interest name for a server-to-server transfer.
+//
+//	/kv/<server-id>/sv-transfer/<key>/<timestamp>
+func SvTransferName(serverID, key string) (enc.Name, error) {
+	base, err := enc.NameFromStr(fmt.Sprintf("%s/%s/%s/%s", PrefixKV, serverID, OpSvTransfer, key))
+	if err != nil {
+		return nil, err
+	}
+	return base.Append(enc.NewTimestampComponent(utils.MakeTimestamp(time.Now()))), nil
+}
+
+// SvReplicateName returns an Interest name for async replication to a replica.
+//
+//	/kv/<server-id>/sv-replicate/<key>/<timestamp>
+func SvReplicateName(serverID, key string) (enc.Name, error) {
+	base, err := enc.NameFromStr(fmt.Sprintf("%s/%s/%s/%s", PrefixKV, serverID, OpSvReplicate, key))
 	if err != nil {
 		return nil, err
 	}
