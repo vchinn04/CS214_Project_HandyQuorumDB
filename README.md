@@ -1,5 +1,9 @@
 # HandyQuorumDB
 
+THIS IS A PORT OF HandyQuorumDB to run over NDN.
+
+Credits for the original implementation go to Niklas Stangl and Marcin Praski.
+
 HandyQuorumDB is a distributed key-value store designed for improved availability and durability guarantees. It incorporates features inpired by [Amazon's DynamoDB](https://dl.acm.org/doi/abs/10.1145/1323293.1294281) such as sloppy quorum and hinted handoff, to enhance robustness and scalability.
 
 It was developed by Marcin Praski and Me for the "Cloud Database Systems" course at TUM.
